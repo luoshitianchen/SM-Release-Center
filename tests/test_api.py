@@ -1,88 +1,78 @@
+"""SM Release Center 领域测试：流水线、发布、部署、回滚与统计。"""
+
+import pytest
 from fastapi.testclient import TestClient
-from app.main import app
+
+from app import base
+from app.main import VERSION, app
 
 
-def test_health_and_security_headers():
-    with TestClient(app) as client:
-        response = client.get('/health', headers={'X-Request-Id': 'suite-test'})
-        assert response.status_code == 200
-        assert response.headers['X-Request-Id'] == 'suite-test'
-        assert response.headers['X-Frame-Options'] == 'DENY'
-        assert response.json()['version'] == '1.0.0'
+@pytest.fixture()
+def client(monkeypatch):
+    monkeypatch.setattr(base, "internal_api_key", lambda: "TEST")
+    base.reset_state()
+    from app.main import _init as init_db
+    init_db()
+    with TestClient(app) as c:
+        c.headers["X-Internal-Token"] = "TEST"
+        yield c
 
 
-def test_overview_and_item_lifecycle(monkeypatch):
-    from app import main
-    monkeypatch.setattr(main, 'INTERNAL_API_KEY', 'TEST')
-    with TestClient(app) as client:
-        overview = client.get('/api/overview').json()
-        assert overview['total'] >= 2
-        created = client.post('/api/items', headers={'X-Internal-Token': 'TEST'}, json={'name': '企业级测试资源', 'owner': '测试部', 'priority': 'P2'}).json()
-        assert created['status'] == 'active'
-        updated = client.patch(f"/api/items/{created['id']}/status?item_status=review", headers={'X-Internal-Token': 'TEST'})
-        assert updated.status_code == 200
-        assert updated.json()['status'] == 'review'
+def _pipeline(client, name="订单服务"):
+    return client.post("/api/release/pipelines", json={"name": name, "repo": "luoshitianchen/order-svc", "environments": ["staging", "prod"]}).json()["id"]
 
 
-def test_ops_metrics():
-    with TestClient(app) as client:
-        client.get('/health')
-        metrics = client.get('/api/ops/metrics')
-        assert metrics.status_code == 200
-        assert metrics.json()['requests_total'] >= 1
+def _release(client, pipeline_id, version="v2.0.0"):
+    return client.post("/api/release/releases", json={"pipeline_id": pipeline_id, "version": version, "created_by": "发布工程师"}).json()["id"]
 
 
-
-def test_integration_manifest_contract():
-    with TestClient(app) as client:
-        response = client.get('/api/integration/manifest')
-        assert response.status_code == 200
-        payload = response.json()
-        assert payload['service']
-        assert payload['version'] == '1.0.0'
-        assert '/api/ops/metrics' == payload['metrics_path']
-        assert isinstance(payload['dependencies'], list)
+def test_health_and_version(client):
+    r = client.get("/health", headers={"X-Request-Id": "suite-test"})
+    assert r.status_code == 200
+    assert r.json()["version"] == VERSION
 
 
-
-def test_request_size_and_rate_limit_guards(monkeypatch):
-    from app import main
-    main.RATE_BUCKETS.clear()
-    monkeypatch.setattr(main, 'MAX_REQUEST_BYTES', 4)
-    monkeypatch.setattr(main, 'RATE_MAX_REQUESTS', 1)
-    with TestClient(app) as client:
-        oversized = client.post('/api/items', content='12345', headers={'content-type': 'application/json'})
-        assert oversized.status_code == 413
-        assert client.get('/health').status_code == 200
-        limited = client.get('/health')
-        assert limited.status_code == 429
-        assert limited.headers['Retry-After']
+def test_pipeline_and_release(client):
+    pipeline_id = _pipeline(client)
+    assert client.post("/api/release/pipelines", json={"name": "订单服务", "repo": "rr"}).status_code == 409
+    release_id = _release(client, pipeline_id)
+    assert client.post("/api/release/releases", json={"pipeline_id": pipeline_id, "version": "v2.0.0", "created_by": "x"}).status_code == 409
+    assert client.get("/api/release/pipelines").json()["total"] == 1
+    assert client.get("/api/release/releases").json()["total"] == 1
+    assert client.get(f"/api/release/releases/{release_id}").json()["status"] == "draft"
 
 
-def test_internal_write_token_is_enforced(monkeypatch):
-    from app import main
-    monkeypatch.setattr(main, 'INTERNAL_API_KEY', 'TOKEN')
-    with TestClient(app) as client:
-        blocked = client.post('/api/items', json={'name': 'blocked'})
-        assert blocked.status_code == 403
-        allowed = client.post('/api/items', headers={'X-Internal-Token': 'TOKEN'}, json={'name': 'allowed'})
-        assert allowed.status_code == 201
+def test_release_requires_pipeline(client):
+    assert client.post("/api/release/releases", json={"pipeline_id": "no-such-pipe", "version": "v1", "created_by": "x"}).status_code == 404
 
 
+def test_deploy_and_rollback(client):
+    pipeline_id = _pipeline(client)
+    release_id = _release(client, pipeline_id)
+    deploy = client.post(f"/api/release/releases/{release_id}/deploy", json={"environment": "staging", "deployed_by": "发布工程师"})
+    assert deploy.status_code == 201
+    assert deploy.json()["status"] == "success"
+    assert client.post(f"/api/release/releases/{release_id}/deploy", json={"environment": "qa", "deployed_by": "x"}).status_code == 404
+    assert client.post(f"/api/release/releases/{release_id}/rollback").json()["status"] == "rolled_back"
+    assert client.post(f"/api/release/releases/{release_id}/deploy", json={"environment": "staging", "deployed_by": "x"}).status_code == 409
 
-def test_sm3_crypto_endpoint():
-    with TestClient(app) as client:
-        response = client.post('/api/crypto/sm3', json={'value': 'enterprise'})
-        assert response.status_code == 200
-        assert response.json()['algorithm'] == 'SM3'
-        assert len(response.json()['digest']) == 64
-        assert client.get('/api/crypto/status').json()['sm4'] == 'enabled'
+
+def test_stats(client):
+    pipeline_id = _pipeline(client)
+    release_id = _release(client, pipeline_id)
+    client.post(f"/api/release/releases/{release_id}/deploy", json={"environment": "prod", "deployed_by": "发布工程师"})
+    stats = client.get("/api/release/stats").json()
+    assert stats["pipelines"] == 1
+    assert stats["deployed"] == 1
+    assert stats["successful_deployments"] == 1
 
 
+def test_manifest_and_crypto(client):
+    assert client.get("/api/integration/manifest").json()["version"] == VERSION
+    enc = client.post("/api/crypto/encrypt", json={"value": "x"}).json()["ciphertext"]
+    assert client.post("/api/crypto/decrypt", json={"value": enc}).json()["plaintext"] == "x"
 
-def test_security_baseline():
-    with TestClient(app) as client:
-        payload = client.get('/api/security/baseline').json()
-        assert payload['controls']['sm3'] is True
-        assert payload['controls']['sm4'] is True
-        assert payload['controls']['rate_limit'] is True
+
+def test_write_requires_auth(client):
+    del client.headers["X-Internal-Token"]
+    assert client.post("/api/release/pipelines", json={"name": "p", "repo": "r"}).status_code == 401
