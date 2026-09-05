@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from app import base
 
 SERVICE = "sm-release-center"
-VERSION = "2.0.0"
+VERSION = "3.0.0"
 NAME = "SM Release Center"
 DESCRIPTION = "发布中心：流水线、发布、部署、环境与回滚"
 PORT = 8550
