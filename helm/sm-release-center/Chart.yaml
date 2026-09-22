@@ -1,0 +1,12 @@
+apiVersion: v2
+name: sm-release-center
+description: SM-* 微服务 Helm Chart - 发布中心服务
+type: application
+version: 1.0.0
+appVersion: "2.1.0"
+keywords:
+  - sm-microservices
+  - storage-governance
+  - enterprise
+maintainers:
+  - name: sm-platform-team
